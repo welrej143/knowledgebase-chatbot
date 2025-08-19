@@ -93,3 +93,11 @@ def sources():
 
 # Serve static files (upload page)
 app.mount("/static", StaticFiles(directory="static"), name="static")
+
+@app.post('/ingest/upload')
+async def ingest_upload(files: List[UploadFile] = File(...)):
+    print(f"[ingest] received {len(files)} file(s): {[f.filename for f in files]}")
+    res = save_and_ingest_uploads(files)
+    print(f"[ingest] result: {res}")
+    return res
+

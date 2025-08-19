@@ -29,7 +29,7 @@
     .status.err { color: var(--err); }
     .footer { margin-top: 14px; display:flex; gap:10px; align-items:center; }
     .small { font-size:12px; color:var(--muted); }
-    .resp { margin-top:16px; background:#0b1220; border:1px solid #1f2937; border-radius:10px; padding:12px; max-height:240px; overflow:auto; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size:12px; color:#d1d5db;}
+    .resp { margin-top:16px; background:#0b1220; border:1px solid #1f2937; border-radius:10px; padding:12px; max-height:260px; overflow:auto; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size:12px; color:#d1d5db;}
     a { color:#93c5fd; }
   </style>
 </head>
@@ -46,9 +46,7 @@
       </div>
 
       <input id="fileInput" class="file-input" type="file" multiple />
-
       <div id="drop" class="drop">Drag &amp; drop files here…</div>
-
       <div id="list" class="list"></div>
 
       <div class="footer">
@@ -61,8 +59,8 @@
   </div>
 
   <script>
-    // --- Config: change if your endpoint differs ---
-    const ENDPOINT = "/ingest/upload"; // matches your FastAPI route
+    const ENDPOINT = "/ingest/upload"; // root-relative, not under /static/
+    document.getElementById('ep').textContent = ENDPOINT;
 
     const fileInput = document.getElementById('fileInput');
     const pickBtn   = document.getElementById('pickBtn');
@@ -70,20 +68,18 @@
     const dropZone  = document.getElementById('drop');
     const listEl    = document.getElementById('list');
     const respEl    = document.getElementById('resp');
-    document.getElementById('ep').textContent = ENDPOINT;
 
-    let queue = []; // {file, el, bar, statusEl}
+    let queue = []; // { file, el, bar, statusEl }
 
     function bytes(n){ return n < 1024 ? n+' B' : n<1048576 ? (n/1024).toFixed(1)+' KB' : (n/1048576).toFixed(1)+' MB'; }
 
     function addFiles(files) {
-      respEl.hidden = true;
       for (const file of files) {
         const el = document.createElement('div');
         el.className = 'item';
         el.innerHTML = `
           <div class="item-head">
-            <div class="name">${file.name}</div>
+            <div class="name" title="${file.name}">${file.name}</div>
             <div class="badge">${bytes(file.size)}</div>
           </div>
           <div class="bar"><div class="fill"></div></div>
@@ -99,71 +95,69 @@
     fileInput.addEventListener('change', (e) => addFiles(e.target.files));
 
     // drag & drop
-    ;['dragenter','dragover'].forEach(ev => {
-      dropZone.addEventListener(ev, e => { e.preventDefault(); e.stopPropagation(); dropZone.classList.add('dragover'); });
-    });
-    ;['dragleave','drop'].forEach(ev => {
-      dropZone.addEventListener(ev, e => { e.preventDefault(); e.stopPropagation(); dropZone.classList.remove('dragover'); });
-    });
+    ['dragenter','dragover'].forEach(ev => dropZone.addEventListener(ev, e => {
+      e.preventDefault(); e.stopPropagation(); dropZone.classList.add('dragover');
+    }));
+    ['dragleave','drop'].forEach(ev => dropZone.addEventListener(ev, e => {
+      e.preventDefault(); e.stopPropagation(); dropZone.classList.remove('dragover');
+    }));
     dropZone.addEventListener('drop', e => addFiles(e.dataTransfer.files));
 
     async function uploadAll() {
+      respEl.hidden = true;
       uploadBtn.disabled = true;
       pickBtn.disabled = true;
 
-      const form = new FormData();
-      queue.forEach(item => form.append('files', item.file));
+      try {
+        const form = new FormData();
+        if (queue.length === 0) throw new Error("No files queued");
+        // IMPORTANT: key must be 'files' to match FastAPI handler
+        queue.forEach(({file}) => form.append('files', file, file.name));
 
-      // Use XHR to get upload progress
-      const xhr = new XMLHttpRequest();
-      xhr.open('POST', ENDPOINT, true);
+        const xhr = new XMLHttpRequest();
+        xhr.open('POST', ENDPOINT, true);
 
-      xhr.upload.onprogress = (e) => {
-        if (!e.lengthComputable) return;
-        // Evenly distribute global progress across items
-        const pct = Math.round((e.loaded / e.total) * 100);
-        queue.forEach(it => it.bar.style.width = pct + '%');
-        queue.forEach(it => it.statusEl.textContent = `Uploading… ${pct}%`);
-      };
+        xhr.timeout = 10 * 60 * 1000; // 10 min
+        xhr.upload.onprogress = (e) => {
+          if (!e.lengthComputable) return;
+          const pct = Math.round((e.loaded / e.total) * 100);
+          queue.forEach(it => { it.bar.style.width = pct + '%'; it.statusEl.textContent = `Uploading… ${pct}%`; });
+        };
 
-      xhr.onreadystatechange = () => {
-        if (xhr.readyState === 4) {
-          try {
+        xhr.onerror = () => {
+          queue.forEach(it => { it.statusEl.textContent = 'Network error'; it.statusEl.classList.add('err'); });
+          respEl.hidden = false;
+          respEl.textContent = 'Network error while sending request.';
+        };
+
+        xhr.ontimeout = () => {
+          queue.forEach(it => { it.statusEl.textContent = 'Request timed out'; it.statusEl.classList.add('err'); });
+          respEl.hidden = false;
+          respEl.textContent = 'Request timed out. Try fewer/lighter files or wait for the service to warm up.';
+        };
+
+        xhr.onreadystatechange = () => {
+          if (xhr.readyState === 4) {
             const ok = xhr.status >= 200 && xhr.status < 300;
-            const data = xhr.responseText;
-            respEl.hidden = false;
-            respEl.textContent = data || '(no response body)';
-
             queue.forEach(it => {
               it.bar.style.width = '100%';
               it.statusEl.textContent = ok ? 'Ingested' : `Error (${xhr.status})`;
               it.statusEl.classList.add(ok ? 'ok' : 'err');
             });
-          } catch (err) {
             respEl.hidden = false;
-            respEl.textContent = 'Error parsing response: ' + err;
-            queue.forEach(it => {
-              it.statusEl.textContent = 'Error';
-              it.statusEl.classList.add('err');
-            });
-          } finally {
+            respEl.textContent = `HTTP ${xhr.status}\n\n` + (xhr.responseText || '(no body)');
             queue = [];
             pickBtn.disabled = false;
           }
-        }
-      };
+        };
 
-      xhr.onerror = () => {
+        xhr.send(form);
+      } catch (err) {
         respEl.hidden = false;
-        respEl.textContent = 'Network error during upload.';
-        queue.forEach(it => {
-          it.statusEl.textContent = 'Error';
-          it.statusEl.classList.add('err');
-        });
+        respEl.textContent = 'Client error: ' + (err?.message || err);
+        queue.forEach(it => { it.statusEl.textContent = 'Error'; it.statusEl.classList.add('err'); });
         pickBtn.disabled = false;
-      };
-
-      xhr.send(form);
+      }
     }
 
     uploadBtn.addEventListener('click', uploadAll);
