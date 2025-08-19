@@ -7,10 +7,10 @@
   <style>
     :root { --bg:#0f172a; --panel:#111827; --text:#e5e7eb; --muted:#9ca3af; --accent:#3b82f6; --ok:#10b981; --err:#ef4444; }
     body { margin:0; font-family:system-ui, -apple-system, Segoe UI, Roboto, Inter, Arial; background:var(--bg); color:var(--text); }
-    .wrap { max-width: 820px; margin: 40px auto; padding: 0 16px; }
+    .wrap { max-width: 860px; margin: 40px auto; padding: 0 16px; }
     h1 { font-size: 20px; font-weight: 700; margin: 0 0 12px; }
     p { color: var(--muted); margin: 0 0 18px; }
-    .card { background: var(--panel); border: 1px solid #1f2937; border-radius: 10px; padding: 18px; }
+    .card { background: var(--panel); border: 1px solid #1f2937; border-radius: 12px; padding: 18px; }
     .row { display:flex; gap: 12px; align-items:center; flex-wrap:wrap; margin-bottom: 12px; }
     .file-input { display:none; }
     .btn { background: var(--accent); color:white; border:0; padding: 10px 14px; border-radius:8px; cursor:pointer; font-weight:600; }
@@ -20,7 +20,7 @@
     .list { margin-top: 14px; display:grid; gap:10px; }
     .item { background:#0b1220; border:1px solid #1f2937; border-radius:10px; padding:12px; }
     .item-head { display:flex; justify-content:space-between; align-items:center; gap:10px; }
-    .name { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .name { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width: 600px; }
     .badge { font-size:12px; color:#d1d5db; }
     .bar { height:8px; border-radius:999px; background:#0f172a; border:1px solid #1f2937; margin-top:8px; overflow:hidden; }
     .fill { height:100%; width:0%; background:var(--accent); transition: width .15s linear; }
@@ -29,14 +29,14 @@
     .status.err { color: var(--err); }
     .footer { margin-top: 14px; display:flex; gap:10px; align-items:center; }
     .small { font-size:12px; color:var(--muted); }
-    .resp { margin-top:16px; background:#0b1220; border:1px solid #1f2937; border-radius:10px; padding:12px; max-height:260px; overflow:auto; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size:12px; color:#d1d5db;}
+    .resp { margin-top:16px; background:#0b1220; border:1px solid #1f2937; border-radius:10px; padding:12px; max-height:280px; overflow:auto; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size:12px; color:#d1d5db;}
     a { color:#93c5fd; }
   </style>
 </head>
 <body>
   <div class="wrap">
     <h1>Upload & Ingest Files</h1>
-    <p>Upload PDFs, DOCX, XLSX (legacy DOC will be auto-converted if LibreOffice is available). Files will be parsed and indexed for the chatbot.</p>
+    <p>Upload PDFs, DOCX, XLSX (legacy DOC will be auto-converted if LibreOffice is available). Files are parsed and indexed one-by-one.</p>
 
     <div class="card">
       <div class="row">
@@ -59,8 +59,7 @@
   </div>
 
   <script>
-    const ENDPOINT = "/ingest/upload";
-    const STATUS = (id) => `/ingest/status/${id}`;
+    const ENDPOINT = "/ingest/upload"; // root-relative
     document.getElementById('ep').textContent = ENDPOINT;
 
     const fileInput = document.getElementById('fileInput');
@@ -70,7 +69,7 @@
     const listEl    = document.getElementById('list');
     const respEl    = document.getElementById('resp');
 
-    let queue = [];
+    let queue = []; // { file, el, bar, statusEl }
 
     function bytes(n){ return n < 1024 ? n+' B' : n<1048576 ? (n/1024).toFixed(1)+' KB' : (n/1048576).toFixed(1)+' MB'; }
 
@@ -95,6 +94,7 @@
     pickBtn.addEventListener('click', () => fileInput.click());
     fileInput.addEventListener('change', (e) => addFiles(e.target.files));
 
+    // drag & drop
     ['dragenter','dragover'].forEach(ev => dropZone.addEventListener(ev, e => {
       e.preventDefault(); e.stopPropagation(); dropZone.classList.add('dragover');
     }));
@@ -103,83 +103,86 @@
     }));
     dropZone.addEventListener('drop', e => addFiles(e.dataTransfer.files));
 
-    function setAll(text, cls='') {
-      queue.forEach(it => { it.statusEl.textContent = text; if (cls) it.statusEl.classList.add(cls); });
-    }
-    function setAllProgress(pct) {
-      queue.forEach(it => { it.bar.style.width = pct+'%'; });
-    }
-
-    async function pollJob(jobId) {
-      // Poll indefinitely until done/error
-      while (true) {
-        try {
-          const r = await fetch(STATUS(jobId));
-          if (!r.ok) throw new Error(`HTTP ${r.status}`);
-          const body = await r.json();
-          respEl.hidden = false;
-          respEl.textContent = JSON.stringify(body, null, 2);
-
-          if (body.status === 'queued') {
-            setAll('Queued…'); setAllProgress(50);
-          } else if (body.status === 'processing') {
-            setAll('Processing…'); setAllProgress(80);
-          } else if (body.status === 'done') {
-            setAll('Ingested', 'ok'); setAllProgress(100);
-            return;
-          } else if (body.status === 'error') {
-            setAll('Error', 'err');
-            return;
-          } else {
-            setAll('Unknown status', 'err');
-            return;
-          }
-        } catch (e) {
-          // transient fetch error -> keep polling
-          setAll('Checking status…');
-        }
-        await new Promise(res => setTimeout(res, 2000));
-      }
-    }
-
-    async function uploadAll() {
-      respEl.hidden = true;
-      uploadBtn.disabled = true;
-      pickBtn.disabled = true;
-
-      try {
+    // --- Upload ONE file (XMLHttpRequest so we get progress) ---
+    function uploadOne(item, timeoutMs = 10 * 60 * 1000) {
+      return new Promise((resolve) => {
         const form = new FormData();
-        if (queue.length === 0) throw new Error("No files queued");
-        queue.forEach(({file}) => form.append('files', file, file.name));
+        form.append('files', item.file, item.file.name);
 
-        setAll('Uploading…'); setAllProgress(30);
+        const xhr = new XMLHttpRequest();
+        xhr.open('POST', ENDPOINT, true);
+        xhr.timeout = timeoutMs;
 
-        const r = await fetch(ENDPOINT, { method: 'POST', body: form });
-        const text = await r.text();
-        respEl.hidden = false;
-        respEl.textContent = `HTTP ${r.status}\n\n${text}`;
+        item.statusEl.textContent = 'Uploading…';
 
-        if (r.status !== 202) {
-          setAll(`Upload failed (${r.status})`, 'err');
-          pickBtn.disabled = false;
-          return;
-        }
-        const { job_id } = JSON.parse(text);
+        xhr.upload.onprogress = (e) => {
+          if (!e.lengthComputable) return;
+          const pct = Math.round((e.loaded / e.total) * 100);
+          item.bar.style.width = pct + '%';
+          item.statusEl.textContent = `Uploading… ${pct}%`;
+        };
 
-        setAll('Queued…'); setAllProgress(50);
-        await pollJob(job_id);
+        xhr.onerror = () => {
+          item.statusEl.textContent = 'Network error';
+          item.statusEl.classList.add('err');
+          resolve({ ok:false, error:'network' });
+        };
 
-        queue = [];
-        pickBtn.disabled = false;
-      } catch (err) {
-        setAll('Client error', 'err');
-        respEl.hidden = false;
-        respEl.textContent = 'Client error: ' + (err?.message || err);
-        pickBtn.disabled = false;
-      }
+        xhr.ontimeout = () => {
+          item.statusEl.textContent = 'Timed out';
+          item.statusEl.classList.add('err');
+          resolve({ ok:false, error:'timeout' });
+        };
+
+        xhr.onreadystatechange = () => {
+          if (xhr.readyState === 4) {
+            const ok = xhr.status >= 200 && xhr.status < 300;
+            if (ok) {
+              item.bar.style.width = '100%';
+              item.statusEl.textContent = 'Ingested';
+              item.statusEl.classList.add('ok');
+              resolve({ ok:true, body: xhr.responseText });
+            } else {
+              let msg = `Error ${xhr.status}`;
+              try { msg += ': ' + (JSON.parse(xhr.responseText).error || ''); } catch {}
+              item.statusEl.textContent = msg;
+              item.statusEl.classList.add('err');
+              resolve({ ok:false, error: msg });
+            }
+          }
+        };
+
+        xhr.send(form);
+      });
     }
 
-    uploadBtn.addEventListener('click', uploadAll);
+    // --- Upload SEQUENTIALLY (best UX & avoids timeouts) ---
+    async function uploadSequential() {
+      respEl.hidden = true;
+      pickBtn.disabled = true;
+      uploadBtn.disabled = true;
+
+      const summary = { ok: 0, failed: 0, details: [] };
+
+      for (const item of queue) {
+        const res = await uploadOne(item);
+        summary.details.push({ file: item.file.name, ...res });
+        if (res.ok) summary.ok++; else summary.failed++;
+      }
+
+      respEl.hidden = false;
+      try {
+        respEl.textContent = JSON.stringify(summary, null, 2);
+      } catch {
+        respEl.textContent = String(summary);
+      }
+
+      // reset
+      queue = [];
+      pickBtn.disabled = false;
+    }
+
+    uploadBtn.addEventListener('click', uploadSequential);
   </script>
 </body>
 </html>
