@@ -59,108 +59,108 @@
   </div>
 
   <script>
-    const ENDPOINT = "/ingest/upload"; // root-relative, not under /static/
-    document.getElementById('ep').textContent = ENDPOINT;
+const ENDPOINT = "/ingest/upload";
+document.getElementById('ep').textContent = ENDPOINT;
 
-    const fileInput = document.getElementById('fileInput');
-    const pickBtn   = document.getElementById('pickBtn');
-    const uploadBtn = document.getElementById('uploadBtn');
-    const dropZone  = document.getElementById('drop');
-    const listEl    = document.getElementById('list');
-    const respEl    = document.getElementById('resp');
+const fileInput = document.getElementById('fileInput');
+const pickBtn   = document.getElementById('pickBtn');
+const uploadBtn = document.getElementById('uploadBtn');
+const dropZone  = document.getElementById('drop');
+const listEl    = document.getElementById('list');
+const respEl    = document.getElementById('resp');
 
-    let queue = []; // { file, el, bar, statusEl }
+let queue = []; // { file, el, bar, statusEl }
 
-    function bytes(n){ return n < 1024 ? n+' B' : n<1048576 ? (n/1024).toFixed(1)+' KB' : (n/1048576).toFixed(1)+' MB'; }
+function bytes(n){ return n < 1024 ? n+' B' : n<1048576 ? (n/1024).toFixed(1)+' KB' : (n/1048576).toFixed(1)+' MB'; }
 
-    function addFiles(files) {
-      for (const file of files) {
-        const el = document.createElement('div');
-        el.className = 'item';
-        el.innerHTML = `
-          <div class="item-head">
-            <div class="name" title="${file.name}">${file.name}</div>
-            <div class="badge">${bytes(file.size)}</div>
-          </div>
-          <div class="bar"><div class="fill"></div></div>
-          <div class="status">Queued</div>
-        `;
-        listEl.appendChild(el);
-        queue.push({ file, el, bar: el.querySelector('.fill'), statusEl: el.querySelector('.status') });
-      }
-      uploadBtn.disabled = queue.length === 0;
+function addFiles(files) {
+  for (const file of files) {
+    const el = document.createElement('div');
+    el.className = 'item';
+    el.innerHTML = `
+      <div class="item-head">
+        <div class="name" title="${file.name}">${file.name}</div>
+        <div class="badge">${bytes(file.size)}</div>
+      </div>
+      <div class="bar"><div class="fill"></div></div>
+      <div class="status">Queued</div>
+    `;
+    listEl.appendChild(el);
+    queue.push({ file, el, bar: el.querySelector('.fill'), statusEl: el.querySelector('.status') });
+  }
+  uploadBtn.disabled = queue.length === 0;
+}
+
+pickBtn.addEventListener('click', () => fileInput.click());
+fileInput.addEventListener('change', (e) => addFiles(e.target.files));
+
+['dragenter','dragover'].forEach(ev => dropZone.addEventListener(ev, e => {
+  e.preventDefault(); e.stopPropagation(); dropZone.classList.add('dragover');
+}));
+['dragleave','drop'].forEach(ev => dropZone.addEventListener(ev, e => {
+  e.preventDefault(); e.stopPropagation(); dropZone.classList.remove('dragover');
+}));
+dropZone.addEventListener('drop', e => addFiles(e.dataTransfer.files));
+
+async function uploadAll() {
+  respEl.hidden = true;
+  uploadBtn.disabled = true;
+  pickBtn.disabled = true;
+
+  try {
+    const form = new FormData();
+    if (queue.length === 0) throw new Error("No files queued");
+    queue.forEach(({file}) => form.append('files', file, file.name));
+
+    // 1) Kick off the job (returns 202 + job_id)
+    const startRes = await fetch(ENDPOINT, { method: 'POST', body: form });
+    const startJson = await startRes.json();
+    if (startRes.status !== 202) throw new Error(startJson.error || `Upload failed (HTTP ${startRes.status})`);
+    const jobId = startJson.job_id;
+
+    // Mark client upload as done (blue bar full)
+    queue.forEach(it => { it.bar.style.width = '100%'; it.statusEl.textContent = 'Processing…'; });
+
+    // 2) Poll status until done/error
+    let done = false;
+    while (!done) {
+      const r = await fetch(`/ingest/status/${jobId}`);
+      const s = await r.json();
+
+      let label = s.status;
+      if (s.status === 'processing') label = s.note || 'Processing…';
+      if (s.status === 'done')       label = `Ingested (chunks_added: ${s?.result?.chunks_added ?? "?"})`;
+      if (s.status === 'error')      label = `Error: ${s.error}`;
+
+      (s.uploaded || queue.map(q => q.file.name)).forEach(name => {
+        // update every file row
+        // (we don't need a precise match per-file since ingestion is batched)
+        queue.forEach(it => it.statusEl.textContent = label);
+        if (s.status === 'done') queue.forEach(it => it.statusEl.classList.add('ok'));
+        if (s.status === 'error') queue.forEach(it => it.statusEl.classList.add('err'));
+      });
+
+      respEl.hidden = false;
+      respEl.textContent = `Status: ${s.status}\n\n` + JSON.stringify(s, null, 2);
+
+      if (s.status === 'done' || s.status === 'error') done = true;
+      else await new Promise(t => setTimeout(t, 2000));
     }
 
-    pickBtn.addEventListener('click', () => fileInput.click());
-    fileInput.addEventListener('change', (e) => addFiles(e.target.files));
+    // Reset
+    queue = [];
+    pickBtn.disabled = false;
 
-    // drag & drop
-    ['dragenter','dragover'].forEach(ev => dropZone.addEventListener(ev, e => {
-      e.preventDefault(); e.stopPropagation(); dropZone.classList.add('dragover');
-    }));
-    ['dragleave','drop'].forEach(ev => dropZone.addEventListener(ev, e => {
-      e.preventDefault(); e.stopPropagation(); dropZone.classList.remove('dragover');
-    }));
-    dropZone.addEventListener('drop', e => addFiles(e.dataTransfer.files));
+  } catch (err) {
+    queue.forEach(it => { it.statusEl.textContent = 'Error'; it.statusEl.classList.add('err'); });
+    respEl.hidden = false;
+    respEl.textContent = 'Client error: ' + (err?.message || err);
+    pickBtn.disabled = false;
+  }
+}
 
-    async function uploadAll() {
-      respEl.hidden = true;
-      uploadBtn.disabled = true;
-      pickBtn.disabled = true;
+uploadBtn.addEventListener('click', uploadAll);
+</script>
 
-      try {
-        const form = new FormData();
-        if (queue.length === 0) throw new Error("No files queued");
-        // IMPORTANT: key must be 'files' to match FastAPI handler
-        queue.forEach(({file}) => form.append('files', file, file.name));
-
-        const xhr = new XMLHttpRequest();
-        xhr.open('POST', ENDPOINT, true);
-
-        xhr.timeout = 10 * 60 * 1000; // 10 min
-        xhr.upload.onprogress = (e) => {
-          if (!e.lengthComputable) return;
-          const pct = Math.round((e.loaded / e.total) * 100);
-          queue.forEach(it => { it.bar.style.width = pct + '%'; it.statusEl.textContent = `Uploading… ${pct}%`; });
-        };
-
-        xhr.onerror = () => {
-          queue.forEach(it => { it.statusEl.textContent = 'Network error'; it.statusEl.classList.add('err'); });
-          respEl.hidden = false;
-          respEl.textContent = 'Network error while sending request.';
-        };
-
-        xhr.ontimeout = () => {
-          queue.forEach(it => { it.statusEl.textContent = 'Request timed out'; it.statusEl.classList.add('err'); });
-          respEl.hidden = false;
-          respEl.textContent = 'Request timed out. Try fewer/lighter files or wait for the service to warm up.';
-        };
-
-        xhr.onreadystatechange = () => {
-          if (xhr.readyState === 4) {
-            const ok = xhr.status >= 200 && xhr.status < 300;
-            queue.forEach(it => {
-              it.bar.style.width = '100%';
-              it.statusEl.textContent = ok ? 'Ingested' : `Error (${xhr.status})`;
-              it.statusEl.classList.add(ok ? 'ok' : 'err');
-            });
-            respEl.hidden = false;
-            respEl.textContent = `HTTP ${xhr.status}\n\n` + (xhr.responseText || '(no body)');
-            queue = [];
-            pickBtn.disabled = false;
-          }
-        };
-
-        xhr.send(form);
-      } catch (err) {
-        respEl.hidden = false;
-        respEl.textContent = 'Client error: ' + (err?.message || err);
-        queue.forEach(it => { it.statusEl.textContent = 'Error'; it.statusEl.classList.add('err'); });
-        pickBtn.disabled = false;
-      }
-    }
-
-    uploadBtn.addEventListener('click', uploadAll);
-  </script>
 </body>
 </html>
