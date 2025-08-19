@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import tempfile
 import threading
@@ -15,9 +16,9 @@ from .config import settings
 from .ingest import rebuild_from_data, save_and_ingest_uploads
 from .rag import answer_query, get_chroma, retrieve
 
-app = FastAPI(title="Ezzogenics KB", version="0.2.0")
+app = FastAPI(title="Ezzogenics KB", version="0.2.1")
 
-# CORS (open for prototype; tighten in prod)
+# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[orig.strip() for orig in settings.CORS_ORIGINS.split(",")],
@@ -26,7 +27,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Serve the chat UI at /
+# UI
 app.mount("/ui", StaticFiles(directory="public", html=True), name="ui")
 app.mount("/static", StaticFiles(directory="static", html=False), name="static")
 
@@ -41,33 +42,53 @@ async def _log_startup():
     prov = (settings.LLM_PROVIDER or "").lower()
     model = settings.OPENAI_MODEL if prov == "openai" else settings.GROQ_MODEL
     key = settings.OPENAI_API_KEY if prov == "openai" else settings.GROQ_API_KEY
-    print(
-        f"[startup] provider={prov} model={model} key_prefix={(key[:10]+'…') if key else '(none)'}"
-    )
+    print(f"[startup] provider={prov} model={model} key_prefix={(key[:10]+'…') if key else '(none)'}")
     os.environ.setdefault("CHROMA_TELEMETRY_DISABLED", "1")
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
+# ---------------- Job store (disk-persisted) ----------------
+
+JOBS_DIR = os.path.join("storage", "jobs")
+os.makedirs(JOBS_DIR, exist_ok=True)
+
+def _job_path(job_id: str) -> str:
+    return os.path.join(JOBS_DIR, f"{job_id}.json")
+
+def _job_save(job_id: str, obj: Dict[str, Any]) -> None:
+    path = _job_path(job_id)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f)
+    os.replace(tmp, path)
+
+def _job_load(job_id: str) -> Dict[str, Any] | None:
+    path = _job_path(job_id)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+# ---------------- Health ----------------
 
 @app.get("/health")
 def health():
     return {"ok": True}
 
+# ---------------- Rebuild (optional) ----------------
 
-# -------- Ingestion (rebuild) --------
 @app.post("/ingest/rebuild")
 def ingest_rebuild():
     return rebuild_from_data()
 
+# ---------------- Background ingestion ----------------
 
-# ========= Non-blocking upload & ingest =========
-_ingest_jobs: Dict[str, Dict[str, Any]] = {}
-
-
-def _ingest_job(job_id: str, job_dir: str):
-    """Run ingestion work in a background thread."""
+def _ingest_job(job_id: str, job_dir: str, uploaded: List[str]) -> None:
+    """Run ingestion work in a background thread (status persisted to disk)."""
     try:
-        _ingest_jobs[job_id]["status"] = "processing"
-        _ingest_jobs[job_id]["note"] = "Parsing and indexing…"
+        _job_save(job_id, {"status": "processing", "uploaded": uploaded, "note": "Parsing and indexing…"})
 
         # Build UploadFile objects from saved files
         to_close: List[Any] = []
@@ -83,7 +104,7 @@ def _ingest_job(job_id: str, job_dir: str):
         # Ingest
         res = save_and_ingest_uploads(files)
 
-        # Clean up file handles & temp dir
+        # Cleanup
         for fobj in to_close:
             try:
                 fobj.close()
@@ -99,26 +120,21 @@ def _ingest_job(job_id: str, job_dir: str):
         except Exception:
             pass
 
-        _ingest_jobs[job_id]["status"] = "done"
-        _ingest_jobs[job_id]["result"] = res
-        _ingest_jobs[job_id]["note"] = "Completed."
+        _job_save(job_id, {"status": "done", "uploaded": uploaded, "result": res, "note": "Completed."})
     except Exception as e:
-        _ingest_jobs[job_id]["status"] = "error"
-        _ingest_jobs[job_id]["error"] = str(e)
-        _ingest_jobs[job_id]["note"] = "Failed during ingestion."
-
+        _job_save(job_id, {"status": "error", "uploaded": uploaded, "error": str(e), "note": "Failed during ingestion."})
 
 @app.post("/ingest/upload")
 async def ingest_upload(files: List[UploadFile] = File(...)):
-    """Accept files immediately, save to a temp dir, kick off a background thread, return 202."""
+    """Accept files, persist to a temp dir, kick off a thread, return 202 with job_id."""
     if not files:
         return JSONResponse({"error": "No files provided"}, status_code=400)
 
     job_id = str(uuid.uuid4())
     job_dir = tempfile.mkdtemp(prefix=f"ingest_{job_id}_")
-
-    # Save streams to disk (so the background thread can reopen them)
     uploaded_names: List[str] = []
+
+    # Save async streams so the worker can reopen them
     for uf in files:
         dest = os.path.join(job_dir, uf.filename)
         os.makedirs(os.path.dirname(dest), exist_ok=True)
@@ -130,26 +146,23 @@ async def ingest_upload(files: List[UploadFile] = File(...)):
                 out.write(chunk)
         uploaded_names.append(uf.filename)
 
-    # Record job & start worker thread
-    _ingest_jobs[job_id] = {
-        "status": "queued",
-        "uploaded": uploaded_names,
-        "note": "Queued. Will start shortly…",
-    }
-    threading.Thread(target=_ingest_job, args=(job_id, job_dir), daemon=True).start()
+    # Persist initial job state
+    _job_save(job_id, {"status": "queued", "uploaded": uploaded_names, "note": "Queued. Will start shortly…"})
+
+    # Start worker
+    threading.Thread(target=_ingest_job, args=(job_id, job_dir, uploaded_names), daemon=True).start()
 
     return JSONResponse({"job_id": job_id, "status": "queued"}, status_code=202)
 
-
 @app.get("/ingest/status/{job_id}")
 def ingest_status(job_id: str):
-    job = _ingest_jobs.get(job_id)
+    job = _job_load(job_id)
     if not job:
         return JSONResponse({"error": "unknown job_id"}, status_code=404)
     return job
 
+# ---------------- Chat & debug ----------------
 
-# ========= Chat & debug =========
 @app.post("/chat")
 async def chat(payload: Dict[str, Any]):
     q = (payload or {}).get("query", "").strip()
@@ -158,11 +171,8 @@ async def chat(payload: Dict[str, Any]):
     try:
         return answer_query(q)
     except Exception as e:
-        import traceback
-
-        traceback.print_exc()
+        import traceback; traceback.print_exc()
         return JSONResponse({"error": str(e)}, status_code=500)
-
 
 @app.post("/debug/retrieve")
 async def debug_retrieve(payload: Dict[str, Any]):
@@ -172,25 +182,15 @@ async def debug_retrieve(payload: Dict[str, Any]):
         items = retrieve(q, k)
         return {"query": q, "k": k, "results": items}
     except Exception as e:
-        import traceback
-
-        traceback.print_exc()
+        import traceback; traceback.print_exc()
         return JSONResponse({"error": str(e)}, status_code=500)
-
 
 @app.get("/debug/sources")
 def debug_sources():
     col = get_chroma()
     res = col.get(include=["metadatas"], limit=100000)
-    sources = sorted(
-        {
-            m.get("source")
-            for m in (res.get("metadatas") or [])
-            if m and m.get("source")
-        }
-    )
+    sources = sorted({m.get("source") for m in (res.get("metadatas") or []) if m and m.get("source")})
     return {"total_sources": len(sources), "sources": sources}
-
 
 @app.get("/sources")
 def sources():

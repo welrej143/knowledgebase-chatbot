@@ -70,7 +70,7 @@
     const listEl    = document.getElementById('list');
     const respEl    = document.getElementById('resp');
 
-    let queue = []; // { file, el, bar, statusEl }
+    let queue = [];
 
     function bytes(n){ return n < 1024 ? n+' B' : n<1048576 ? (n/1024).toFixed(1)+' KB' : (n/1048576).toFixed(1)+' MB'; }
 
@@ -103,7 +103,7 @@
     }));
     dropZone.addEventListener('drop', e => addFiles(e.dataTransfer.files));
 
-    function setAllStatus(text, cls='') {
+    function setAll(text, cls='') {
       queue.forEach(it => { it.statusEl.textContent = text; if (cls) it.statusEl.classList.add(cls); });
     }
     function setAllProgress(pct) {
@@ -111,36 +111,35 @@
     }
 
     async function pollJob(jobId) {
-      let tries = 0;
-      const maxTries = 600; // ~20 minutes @ 2s
-      while (tries++ < maxTries) {
-        const r = await fetch(STATUS(jobId));
-        if (!r.ok) throw new Error(`Status check failed: HTTP ${r.status}`);
-        const body = await r.json();
-        respEl.hidden = false;
-        respEl.textContent = JSON.stringify(body, null, 2);
+      // Poll indefinitely until done/error
+      while (true) {
+        try {
+          const r = await fetch(STATUS(jobId));
+          if (!r.ok) throw new Error(`HTTP ${r.status}`);
+          const body = await r.json();
+          respEl.hidden = false;
+          respEl.textContent = JSON.stringify(body, null, 2);
 
-        if (body.status === 'queued') {
-          setAllStatus('Queued…');
-          await new Promise(res => setTimeout(res, 2000));
-        } else if (body.status === 'processing') {
-          setAllStatus('Processing…');
-          setAllProgress(80);
-          await new Promise(res => setTimeout(res, 2000));
-        } else if (body.status === 'done') {
-          setAllStatus('Ingested', 'ok');
-          setAllProgress(100);
-          return;
-        } else if (body.status === 'error') {
-          setAllStatus('Error', 'err');
-          setAllProgress(0);
-          return;
-        } else {
-          setAllStatus('Unknown status', 'err');
-          return;
+          if (body.status === 'queued') {
+            setAll('Queued…'); setAllProgress(50);
+          } else if (body.status === 'processing') {
+            setAll('Processing…'); setAllProgress(80);
+          } else if (body.status === 'done') {
+            setAll('Ingested', 'ok'); setAllProgress(100);
+            return;
+          } else if (body.status === 'error') {
+            setAll('Error', 'err');
+            return;
+          } else {
+            setAll('Unknown status', 'err');
+            return;
+          }
+        } catch (e) {
+          // transient fetch error -> keep polling
+          setAll('Checking status…');
         }
+        await new Promise(res => setTimeout(res, 2000));
       }
-      setAllStatus('Timed out waiting for ingestion', 'err');
     }
 
     async function uploadAll() {
@@ -153,9 +152,7 @@
         if (queue.length === 0) throw new Error("No files queued");
         queue.forEach(({file}) => form.append('files', file, file.name));
 
-        // optimistic UI
-        setAllStatus('Uploading…');
-        setAllProgress(30);
+        setAll('Uploading…'); setAllProgress(30);
 
         const r = await fetch(ENDPOINT, { method: 'POST', body: form });
         const text = await r.text();
@@ -163,21 +160,19 @@
         respEl.textContent = `HTTP ${r.status}\n\n${text}`;
 
         if (r.status !== 202) {
-          setAllStatus(`Upload failed (${r.status})`, 'err');
+          setAll(`Upload failed (${r.status})`, 'err');
           pickBtn.disabled = false;
           return;
         }
-
         const { job_id } = JSON.parse(text);
-        setAllStatus('Queued…');
-        setAllProgress(50);
 
+        setAll('Queued…'); setAllProgress(50);
         await pollJob(job_id);
 
         queue = [];
         pickBtn.disabled = false;
       } catch (err) {
-        setAllStatus('Client error', 'err');
+        setAll('Client error', 'err');
         respEl.hidden = false;
         respEl.textContent = 'Client error: ' + (err?.message || err);
         pickBtn.disabled = false;
