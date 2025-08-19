@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Upload & Ingest Files</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    :root { --bg:#0f172a; --panel:#111827; --text:#e5e7eb; --muted:#9ca3af; --accent:#3b82f6; --ok:#10b981; --err:#ef4444; }
+    body { margin:0; font-family:system-ui, -apple-system, Segoe UI, Roboto, Inter, Arial; background:var(--bg); color:var(--text); }
+    .wrap { max-width: 820px; margin: 40px auto; padding: 0 16px; }
+    h1 { font-size: 20px; font-weight: 700; margin: 0 0 12px; }
+    p { color: var(--muted); margin: 0 0 18px; }
+    .card { background: var(--panel); border: 1px solid #1f2937; border-radius: 10px; padding: 18px; }
+    .row { display:flex; gap: 12px; align-items:center; flex-wrap:wrap; margin-bottom: 12px; }
+    .file-input { display:none; }
+    .btn { background: var(--accent); color:white; border:0; padding: 10px 14px; border-radius:8px; cursor:pointer; font-weight:600; }
+    .btn:disabled { opacity:.6; cursor:not-allowed; }
+    .drop { border:2px dashed #334155; border-radius:10px; padding: 24px; text-align:center; color:var(--muted); transition: .15s border-color; }
+    .drop.dragover { border-color: var(--accent); color: var(--text); }
+    .list { margin-top: 14px; display:grid; gap:10px; }
+    .item { background:#0b1220; border:1px solid #1f2937; border-radius:10px; padding:12px; }
+    .item-head { display:flex; justify-content:space-between; align-items:center; gap:10px; }
+    .name { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .badge { font-size:12px; color:#d1d5db; }
+    .bar { height:8px; border-radius:999px; background:#0f172a; border:1px solid #1f2937; margin-top:8px; overflow:hidden; }
+    .fill { height:100%; width:0%; background:var(--accent); transition: width .15s linear; }
+    .status { margin-top:6px; font-size:12px; color:var(--muted); }
+    .status.ok { color: var(--ok); }
+    .status.err { color: var(--err); }
+    .footer { margin-top: 14px; display:flex; gap:10px; align-items:center; }
+    .small { font-size:12px; color:var(--muted); }
+    .resp { margin-top:16px; background:#0b1220; border:1px solid #1f2937; border-radius:10px; padding:12px; max-height:240px; overflow:auto; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size:12px; color:#d1d5db;}
+    a { color:#93c5fd; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Upload & Ingest Files</h1>
+    <p>Upload PDFs, DOCX, XLSX (legacy DOC will be auto-converted if LibreOffice is available). Files will be parsed and indexed for the chatbot.</p>
+
+    <div class="card">
+      <div class="row">
+        <button id="pickBtn" class="btn">Choose files</button>
+        <button id="uploadBtn" class="btn" disabled>Upload & Ingest</button>
+        <span class="small">You can also drag &amp; drop files below.</span>
+      </div>
+
+      <input id="fileInput" class="file-input" type="file" multiple />
+
+      <div id="drop" class="drop">Drag &amp; drop files here…</div>
+
+      <div id="list" class="list"></div>
+
+      <div class="footer">
+        <span class="small">Endpoint: <code id="ep">/ingest/upload</code></span>
+        <span class="small">After upload, ask questions on <a href="/">the chat page</a>.</span>
+      </div>
+
+      <pre id="resp" class="resp" hidden></pre>
+    </div>
+  </div>
+
+  <script>
+    // --- Config: change if your endpoint differs ---
+    const ENDPOINT = "/ingest/upload"; // matches your FastAPI route
+
+    const fileInput = document.getElementById('fileInput');
+    const pickBtn   = document.getElementById('pickBtn');
+    const uploadBtn = document.getElementById('uploadBtn');
+    const dropZone  = document.getElementById('drop');
+    const listEl    = document.getElementById('list');
+    const respEl    = document.getElementById('resp');
+    document.getElementById('ep').textContent = ENDPOINT;
+
+    let queue = []; // {file, el, bar, statusEl}
+
+    function bytes(n){ return n < 1024 ? n+' B' : n<1048576 ? (n/1024).toFixed(1)+' KB' : (n/1048576).toFixed(1)+' MB'; }
+
+    function addFiles(files) {
+      respEl.hidden = true;
+      for (const file of files) {
+        const el = document.createElement('div');
+        el.className = 'item';
+        el.innerHTML = `
+          <div class="item-head">
+            <div class="name">${file.name}</div>
+            <div class="badge">${bytes(file.size)}</div>
+          </div>
+          <div class="bar"><div class="fill"></div></div>
+          <div class="status">Queued</div>
+        `;
+        listEl.appendChild(el);
+        queue.push({ file, el, bar: el.querySelector('.fill'), statusEl: el.querySelector('.status') });
+      }
+      uploadBtn.disabled = queue.length === 0;
+    }
+
+    pickBtn.addEventListener('click', () => fileInput.click());
+    fileInput.addEventListener('change', (e) => addFiles(e.target.files));
+
+    // drag & drop
+    ;['dragenter','dragover'].forEach(ev => {
+      dropZone.addEventListener(ev, e => { e.preventDefault(); e.stopPropagation(); dropZone.classList.add('dragover'); });
+    });
+    ;['dragleave','drop'].forEach(ev => {
+      dropZone.addEventListener(ev, e => { e.preventDefault(); e.stopPropagation(); dropZone.classList.remove('dragover'); });
+    });
+    dropZone.addEventListener('drop', e => addFiles(e.dataTransfer.files));
+
+    async function uploadAll() {
+      uploadBtn.disabled = true;
+      pickBtn.disabled = true;
+
+      const form = new FormData();
+      queue.forEach(item => form.append('files', item.file));
+
+      // Use XHR to get upload progress
+      const xhr = new XMLHttpRequest();
+      xhr.open('POST', ENDPOINT, true);
+
+      xhr.upload.onprogress = (e) => {
+        if (!e.lengthComputable) return;
+        // Evenly distribute global progress across items
+        const pct = Math.round((e.loaded / e.total) * 100);
+        queue.forEach(it => it.bar.style.width = pct + '%');
+        queue.forEach(it => it.statusEl.textContent = `Uploading… ${pct}%`);
+      };
+
+      xhr.onreadystatechange = () => {
+        if (xhr.readyState === 4) {
+          try {
+            const ok = xhr.status >= 200 && xhr.status < 300;
+            const data = xhr.responseText;
+            respEl.hidden = false;
+            respEl.textContent = data || '(no response body)';
+
+            queue.forEach(it => {
+              it.bar.style.width = '100%';
+              it.statusEl.textContent = ok ? 'Ingested' : `Error (${xhr.status})`;
+              it.statusEl.classList.add(ok ? 'ok' : 'err');
+            });
+          } catch (err) {
+            respEl.hidden = false;
+            respEl.textContent = 'Error parsing response: ' + err;
+            queue.forEach(it => {
+              it.statusEl.textContent = 'Error';
+              it.statusEl.classList.add('err');
+            });
+          } finally {
+            queue = [];
+            pickBtn.disabled = false;
+          }
+        }
+      };
+
+      xhr.onerror = () => {
+        respEl.hidden = false;
+        respEl.textContent = 'Network error during upload.';
+        queue.forEach(it => {
+          it.statusEl.textContent = 'Error';
+          it.statusEl.classList.add('err');
+        });
+        pickBtn.disabled = false;
+      };
+
+      xhr.send(form);
+    }
+
+    uploadBtn.addEventListener('click', uploadAll);
+  </script>
+</body>
+</html>

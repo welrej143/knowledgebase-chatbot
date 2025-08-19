@@ -90,3 +90,6 @@ def debug_sources():
 @app.get('/sources')
 def sources():
     return {'message': 'Ask via /chat; citations include file and page.'}
+
+# Serve static files (upload page)
+app.mount("/static", StaticFiles(directory="static"), name="static")
