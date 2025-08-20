@@ -1,18 +1,27 @@
 name: Keep Render app awake
 
 on:
+  # Run every 5 minutes
   schedule:
-    # Every 5 minutes
     - cron: "*/5 * * * *"
-  workflow_dispatch:  # allow manual trigger from Actions tab
+  # Show the "Run workflow" button in the Actions tab
+  workflow_dispatch:
+  # Also run when THIS file changes, so you can see an immediate run after edits
+  push:
+    paths:
+      - ".github/workflows/keepalive.yml"
 
 jobs:
   ping:
     runs-on: ubuntu-latest
+    timeout-minutes: 4
     steps:
-      - name: Ping Render health endpoint
+      - name: Ping health endpoint
+        shell: bash
         run: |
           URL="https://knowledgebase-chatbot.onrender.com/health"
+          # Add a tiny jitter so many repos don't align perfectly
+          sleep $((RANDOM % 20))
           echo "Pinging $URL ..."
-          # -f fail on HTTP errors, -s silent but show errors, --max-time timeout (sec)
-          curl -fsS --max-time 10 "$URL" || echo "Ping failed (will try again next run)"
+          # -f: fail on HTTP errors, -sS: silent but show errors, -m: timeout
+          curl -fsS -m 10 "$URL" || echo "Ping failed (service may be sleeping)"
