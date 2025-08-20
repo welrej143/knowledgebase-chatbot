@@ -5,6 +5,10 @@ on:
     # Run every 5 minutes
     - cron: "*/5 * * * *"
   workflow_dispatch: {}  # allow manual run from GitHub UI
+  push:
+    paths:
+      - ".github/workflows/keepalive.yml"
+
 
 jobs:
   ping:
