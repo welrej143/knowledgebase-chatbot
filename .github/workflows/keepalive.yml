@@ -14,4 +14,5 @@ jobs:
         run: |
           URL="https://knowledgebase-chatbot.onrender.com/health"
           echo "Pinging $URL ..."
-          curl -fsS --max-time 10 "$URL" || echo "Ping failed (service may be sleeping, will retry on next run)"
+          # -f fail on HTTP errors, -s silent but show errors, --max-time timeout (sec)
+          curl -fsS --max-time 10 "$URL" || echo "Ping failed (will try again next run)"
