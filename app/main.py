@@ -1,3 +1,4 @@
+# app/main.py
 from __future__ import annotations
 
 import json
@@ -19,7 +20,7 @@ from .ingest import rebuild_from_data, save_and_ingest_uploads
 from .rag import answer_query, get_chroma, retrieve, embedder
 
 
-app = FastAPI(title="Ezzogenics KB", version="0.3.0")
+app = FastAPI(title="Ezzogenics KB", version="0.3.1")
 
 # CORS
 app.add_middleware(
@@ -41,13 +42,12 @@ def root():
 
 
 # -------------------- Startup warmup --------------------
-
 @app.on_event("startup")
 async def _startup():
     prov = (settings.LLM_PROVIDER or "").lower()
     model = settings.OPENAI_MODEL if prov == "openai" else settings.GROQ_MODEL
     key = settings.OPENAI_API_KEY if prov == "openai" else settings.GROQ_API_KEY
-    print(f"[startup] provider={prov} model={model} key_prefix={(key[:10]+'…') if key else '(none)'}")
+    print(f"[startup] provider={prov} model={model} key_prefix={(key[:10]+'…') if key else '(none)')}")
 
     os.environ.setdefault("CHROMA_TELEMETRY_DISABLED", "1")
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
@@ -81,8 +81,9 @@ def health():
 
 
 # -------------------- Job store (disk-persisted) --------------------
-
-JOBS_DIR = os.path.join("storage", "jobs")
+# Persist job JSON to the Render disk so status survives restarts.
+# Set JOBS_DIR in env if you want a different location; defaults to the disk mount.
+JOBS_DIR = os.getenv("JOBS_DIR", "/var/data/jobs")
 os.makedirs(JOBS_DIR, exist_ok=True)
 
 def _job_path(job_id: str) -> str:
@@ -105,14 +106,12 @@ def _job_load(job_id: str) -> Dict[str, Any] | None:
 
 
 # -------------------- Rebuild (optional) --------------------
-
 @app.post("/ingest/rebuild")
 def ingest_rebuild():
     return rebuild_from_data()
 
 
 # -------------------- Background ingestion --------------------
-
 WATCHDOG_IDLE_SECS = 30 * 60  # 30 minutes
 
 def _ingest_job(job_id: str, job_dir: str, uploaded: List[str]) -> None:
@@ -173,11 +172,11 @@ def _ingest_job(job_id: str, job_dir: str, uploaded: List[str]) -> None:
             "step": "complete",
             "note": "Completed."
         })
-    except Exception as e:
+    except Exception:
         _job_save(job_id, {
             "status": "error",
             "uploaded": uploaded,
-            "error": str(e),
+            "error": str(Exception),
             "traceback": tb.format_exc(),
             "started_at": _job_load(job_id)["started_at"] if _job_load(job_id) else int(time.time()),
             "step": "exception",
@@ -240,7 +239,6 @@ def ingest_status(job_id: str):
 
 
 # -------------------- Chat & debug --------------------
-
 @app.post("/chat")
 async def chat(payload: Dict[str, Any]):
     q = (payload or {}).get("query", "").strip()
