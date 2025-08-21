@@ -46,15 +46,23 @@ def rebuild_from_data() -> Dict[str, Any]:
     print(res)
     return res
 
-def save_and_ingest_uploads(files):
-    """Not used in CLI; kept for API upload route."""
+def save_and_ingest_uploads(files) -> Dict[str, Any]:
+    """
+    Save UploadFile(s) into DATA_DIR, run ingestion once,
+    return dict with 'chunks_added' and 'uploaded'.
+    """
     os.makedirs(DATA_DIR, exist_ok=True)
     saved = []
     for f in files:
         path = os.path.join(DATA_DIR, f.filename)
         with open(path, "wb") as w:
-            w.write(f.file.read())
+            # f.file may be a bytes-like obj or a file-like object
+            if hasattr(f.file, "read"):
+                w.write(f.file.read())
+            else:
+                w.write(f.file)
         saved.append(f.filename)
+
     out = ingest_folder(DATA_DIR)
     out["uploaded"] = saved
     return out

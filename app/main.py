@@ -16,10 +16,10 @@ from fastapi.staticfiles import StaticFiles
 
 from .config import settings
 from .ingest import rebuild_from_data, save_and_ingest_uploads
-from .rag import answer_query, get_chroma, retrieve
+from .rag import answer_query, get_chroma, retrieve, embedder
 
 
-app = FastAPI(title="Ezzogenics KB", version="0.2.2")
+app = FastAPI(title="Ezzogenics KB", version="0.3.0")
 
 # CORS
 app.add_middleware(
@@ -40,14 +40,39 @@ def root():
     return FileResponse(os.path.join("public", "index.html"))
 
 
+# -------------------- Startup warmup --------------------
+
 @app.on_event("startup")
-async def _log_startup():
+async def _startup():
     prov = (settings.LLM_PROVIDER or "").lower()
     model = settings.OPENAI_MODEL if prov == "openai" else settings.GROQ_MODEL
     key = settings.OPENAI_API_KEY if prov == "openai" else settings.GROQ_API_KEY
     print(f"[startup] provider={prov} model={model} key_prefix={(key[:10]+'…') if key else '(none)'}")
+
     os.environ.setdefault("CHROMA_TELEMETRY_DISABLED", "1")
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
+    # warm the embedding model and vector index so the first query is fast
+    try:
+        _ = embedder(["warmup"])
+        col = get_chroma()
+        _ = col.count()
+        col.query(query_texts=["warmup"], n_results=1, include=[])
+        print("[warmup] embeddings + Chroma opened.")
+    except Exception as e:
+        print(f"[warmup] skipped: {e}")
+
+
+@app.get("/warmup")
+def warmup():
+    """Ping this from GitHub Actions/UptimeRobot; keeps containers 'hot'."""
+    try:
+        _ = embedder(["warmup"])
+        col = get_chroma()
+        col.query(query_texts=["warmup"], n_results=1, include=[])
+        return {"ok": True}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
 
 @app.get("/health")
@@ -93,10 +118,11 @@ WATCHDOG_IDLE_SECS = 30 * 60  # 30 minutes
 def _ingest_job(job_id: str, job_dir: str, uploaded: List[str]) -> None:
     """Run ingestion work in a background thread (status persisted to disk)."""
     try:
+        started = int(time.time())
         _job_save(job_id, {
             "status": "processing",
             "uploaded": uploaded,
-            "started_at": int(time.time()),
+            "started_at": started,
             "step": "opening-files",
             "note": "Parsing and indexing…"
         })
@@ -115,7 +141,7 @@ def _ingest_job(job_id: str, job_dir: str, uploaded: List[str]) -> None:
         _job_save(job_id, {
             "status": "processing",
             "uploaded": uploaded,
-            "started_at": _job_load(job_id)["started_at"],
+            "started_at": started,
             "step": "ingest-start",
             "note": "Calling save_and_ingest_uploads…"
         })
@@ -125,12 +151,16 @@ def _ingest_job(job_id: str, job_dir: str, uploaded: List[str]) -> None:
 
         # Cleanup temp files
         for fobj in to_close:
-            try: fobj.close()
-            except Exception: pass
+            try:
+                fobj.close()
+            except Exception:
+                pass
         try:
             for name in os.listdir(job_dir):
-                try: os.remove(os.path.join(job_dir, name))
-                except Exception: pass
+                try:
+                    os.remove(os.path.join(job_dir, name))
+                except Exception:
+                    pass
             os.rmdir(job_dir)
         except Exception:
             pass
@@ -138,8 +168,8 @@ def _ingest_job(job_id: str, job_dir: str, uploaded: List[str]) -> None:
         _job_save(job_id, {
             "status": "done",
             "uploaded": uploaded,
-            "result": res,
-            "started_at": _job_load(job_id)["started_at"],
+            "result": res,               # includes chunks_added
+            "started_at": started,
             "step": "complete",
             "note": "Completed."
         })
@@ -157,7 +187,10 @@ def _ingest_job(job_id: str, job_dir: str, uploaded: List[str]) -> None:
 
 @app.post("/ingest/upload")
 async def ingest_upload(files: List[UploadFile] = File(...)):
-    """Accept files, persist to temp dir, kick off a thread, return 202 with job_id."""
+    """
+    Accept multiple files, persist them to a temp dir,
+    kick off a background thread, return 202 + job_id.
+    """
     if not files:
         return JSONResponse({"error": "No files provided"}, status_code=400)
 

@@ -34,6 +34,7 @@ class FastEmbedder:
         batch = list(input)  # Chroma may pass a tuple
         return [vec.tolist() for vec in self.model.embed(batch)]
 
+# Exported so main.py can warm it up
 embedder = FastEmbedder(getattr(settings, "EMBEDDING_MODEL", None))
 
 # ---------------------------
