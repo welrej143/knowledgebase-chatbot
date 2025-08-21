@@ -47,7 +47,7 @@ async def _startup():
     prov = (settings.LLM_PROVIDER or "").lower()
     model = settings.OPENAI_MODEL if prov == "openai" else settings.GROQ_MODEL
     key = settings.OPENAI_API_KEY if prov == "openai" else settings.GROQ_API_KEY
-    print(f"[startup] provider={prov} model={model} key_prefix={(key[:10]+'…') if key else '(none)')}")
+    print(f"[startup] provider={prov} model={model} key_prefix={(key[:10]+'…') if key else '(none)'}")
 
     os.environ.setdefault("CHROMA_TELEMETRY_DISABLED", "1")
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
