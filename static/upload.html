@@ -117,8 +117,6 @@
 
             if (j.status === 'done')   return { ok:true, body:j };
             if (j.status === 'error')  return { ok:false, body:j };
-          } else {
-            // if status endpoint fails transiently, keep polling
           }
         } catch (_) { /* ignore transient fetch error */ }
 
@@ -193,16 +191,30 @@
 
         // 2) poll status
         const res = await pollStatus(sent.job_id, (j) => {
-          // update live state
           if (j.step)  item.statusEl.textContent = `${j.step.replace(/-/g,' ')}…`;
           if (j.status === 'processing') item.statusEl.textContent = 'Processing…';
         });
 
         if (res.ok) {
-          item.statusEl.textContent = 'Ingested';
+          // Pull chunks count from the final job JSON
+          const chunks =
+            (res.body && res.body.result && typeof res.body.result.chunks_added === 'number')
+              ? res.body.result.chunks_added
+              : (typeof res.body?.chunks_added === 'number' ? res.body.chunks_added : null);
+
+          item.statusEl.textContent = (chunks !== null && chunks !== undefined)
+            ? `Ingested (${chunks} chunks)`
+            : 'Ingested';
           item.statusEl.classList.add('ok');
+
           summary.ok++;
-          summary.details.push({ file:item.file.name, ok:true, job_id:sent.job_id, result:res.body?.result || null });
+          summary.details.push({
+            file: item.file.name,
+            ok: true,
+            job_id: sent.job_id,
+            chunks_added: chunks ?? null,
+            result: res.body?.result || null
+          });
         } else {
           const note = res.body?.note || 'Error';
           item.statusEl.textContent = note;
