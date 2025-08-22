@@ -27,7 +27,6 @@
     .status { margin-top:6px; font-size:12px; color:var(--muted); }
     .status.ok { color: var(--ok); }
     .status.err { color: var(--err); }
-    .footer { margin-top: 14px; display:flex; gap:10px; align-items:center; }
     .small { font-size:12px; color:var(--muted); }
     .resp { margin-top:16px; background:#0b1220; border:1px solid #1f2937; border-radius:10px; padding:12px; max-height:280px; overflow:auto; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size:12px; color:#d1d5db;}
     a { color:#93c5fd; }
@@ -36,7 +35,10 @@
 <body>
   <div class="wrap">
     <h1>Upload & Ingest Files</h1>
-    <p>Upload PDFs, DOCX, XLSX (legacy DOC will be auto-converted if LibreOffice is available). Files are parsed and indexed <b>in the background</b>. This page will show status when ingestion is truly complete.</p>
+    <p>
+      Upload PDFs, DOCX, XLSX (legacy DOC auto-converted if LibreOffice is available).
+      Files are parsed and indexed <b>in the background</b>. This page will show status when ingestion is truly complete.
+    </p>
 
     <div class="card">
       <div class="row">
@@ -49,9 +51,8 @@
       <div id="drop" class="drop">Drag &amp; drop files here…</div>
       <div id="list" class="list"></div>
 
-      <div class="footer">
-        <span class="small">Endpoint: <code id="ep">/ingest/upload</code></span>
-        <span class="small">After upload, ask questions on <a href="/">the chat page</a>.</span>
+      <div class="small" style="margin-top:8px">
+        Endpoint: <code>/ingest/upload</code> • Status: <code>/ingest/status/:job_id</code>
       </div>
 
       <pre id="resp" class="resp" hidden></pre>
@@ -60,8 +61,7 @@
 
   <script>
     const ENDPOINT = "/ingest/upload";
-    const STATUS_EP = id => `/ingest/status/${id}`;
-    document.getElementById('ep').textContent = ENDPOINT;
+    const STATUS_EP = (id) => `/ingest/status/${id}`;
 
     const fileInput = document.getElementById('fileInput');
     const pickBtn   = document.getElementById('pickBtn');
@@ -104,107 +104,121 @@
     }));
     dropZone.addEventListener('drop', e => addFiles(e.dataTransfer.files));
 
-    function sleep(ms){ return new Promise(r=>setTimeout(r, ms)); }
-
-    async function pollJob(jobId){
-      for (let i=0; i<180; i++) { // ~9 min @ 3s
+    // --- Poll server job status (up to 30 minutes) ---
+    async function pollStatus(jobId, onUpdate) {
+      const deadline = Date.now() + (30 * 60 * 1000);   // 30 min max per file
+      let delay = 5000;                                  // 5s start
+      while (Date.now() < deadline) {
         try {
-          const r = await fetch(STATUS_EP(jobId));
+          const r = await fetch(STATUS_EP(jobId), { cache: 'no-store' });
           if (r.ok) {
             const j = await r.json();
-            const st = (j.status || '').toLowerCase();
-            const step = j.step || '';
-            if (st === 'done' || st === 'empty') {
-              const chunks = j?.result?.chunks_added ?? 0;
-              queue.forEach(it => {
-                it.bar.style.width = '100%';
-                it.statusEl.textContent = chunks > 0 ? `Ingested (${chunks} chunks)` : 'No text found';
-                it.statusEl.classList.add(chunks > 0 ? 'ok' : 'err');
-              });
-              return j;
-            }
-            if (st === 'error') {
-              const err = j.error || j.note || 'unknown error';
-              queue.forEach(it => {
-                it.bar.style.width = '100%';
-                it.statusEl.textContent = `Error: ${err}`;
-                it.statusEl.classList.add('err');
-              });
-              return j;
-            }
-            queue.forEach(it => { it.statusEl.textContent = `Processing… (${step || st})`; });
+            if (onUpdate) onUpdate(j);
+
+            if (j.status === 'done')   return { ok:true, body:j };
+            if (j.status === 'error')  return { ok:false, body:j };
           } else {
-            queue.forEach(it => { it.statusEl.textContent = 'Waiting…'; });
+            // if status endpoint fails transiently, keep polling
           }
-        } catch {
-          queue.forEach(it => { it.statusEl.textContent = 'Waiting…'; });
-        }
-        await sleep(3000);
+        } catch (_) { /* ignore transient fetch error */ }
+
+        // exponential backoff with cap
+        await new Promise(res => setTimeout(res, delay));
+        delay = Math.min(delay * 1.4, 15000);
       }
-      queue.forEach(it => { it.statusEl.textContent = 'Timed out waiting for ingestion'; it.statusEl.classList.add('err'); });
-      return null;
+      return { ok:false, body:{ status:'timeout', note:'Timed out waiting for ingestion' } };
     }
 
-    async function uploadAll() {
-      respEl.hidden = true;
-      pickBtn.disabled = true;
-      uploadBtn.disabled = true;
-
-      try {
-        // Build a single multipart request (server will process all files in one background job)
+    // --- Upload ONE file (returns {ok, job_id, body}) ---
+    function uploadOne(item, timeoutMs = 10 * 60 * 1000) {
+      return new Promise((resolve) => {
         const form = new FormData();
-        if (queue.length === 0) throw new Error("No files queued");
-        queue.forEach(({file}) => form.append('files', file, file.name));
+        form.append('files', item.file, item.file.name);
 
-        // Progress (upload only)
         const xhr = new XMLHttpRequest();
         xhr.open('POST', ENDPOINT, true);
-        xhr.timeout = 10 * 60 * 1000;
+        xhr.timeout = timeoutMs;
+
+        item.statusEl.textContent = 'Uploading…';
 
         xhr.upload.onprogress = (e) => {
           if (!e.lengthComputable) return;
           const pct = Math.round((e.loaded / e.total) * 100);
-          queue.forEach(it => { it.bar.style.width = pct + '%'; it.statusEl.textContent = `Uploading… ${pct}%`; });
+          item.bar.style.width = pct + '%';
+          item.statusEl.textContent = `Uploading… ${pct}%`;
         };
 
-        xhr.onreadystatechange = async () => {
+        xhr.onerror = () => resolve({ ok:false, error:'network' });
+        xhr.ontimeout = () => resolve({ ok:false, error:'timeout' });
+
+        xhr.onreadystatechange = () => {
           if (xhr.readyState === 4) {
             const ok = xhr.status >= 200 && xhr.status < 300;
-            respEl.hidden = false;
-            respEl.textContent = `HTTP ${xhr.status}\n\n` + (xhr.responseText || '(no body)');
-
             if (!ok) {
-              queue.forEach(it => { it.statusEl.textContent = `Upload error (${xhr.status})`; it.statusEl.classList.add('err'); });
-              pickBtn.disabled = false;
-              return;
+              let msg = `Error ${xhr.status}`;
+              try { msg += ': ' + (JSON.parse(xhr.responseText).error || ''); } catch {}
+              return resolve({ ok:false, error: msg });
             }
-            // Parse job id and poll
-            let body = {};
-            try { body = JSON.parse(xhr.responseText || "{}"); } catch {}
-            const jobId = body.job_id;
-            if (!jobId) {
-              queue.forEach(it => { it.statusEl.textContent = 'Missing job_id'; it.statusEl.classList.add('err'); });
-              pickBtn.disabled = false;
-              return;
-            }
-            // switch UI to processing + poll
-            queue.forEach(it => { it.statusEl.textContent = 'Processing…'; it.bar.style.width = '100%'; });
-            await pollJob(jobId);
-            queue = [];
-            pickBtn.disabled = false;
+            // Parse {"job_id":"...","status":"queued"}
+            let job_id = null;
+            try { job_id = JSON.parse(xhr.responseText).job_id; } catch {}
+            resolve({ ok:true, job_id, body: xhr.responseText });
           }
         };
-
         xhr.send(form);
-      } catch (err) {
-        respEl.hidden = false;
-        respEl.textContent = 'Client error: ' + (err?.message || err);
-        queue.forEach(it => { it.statusEl.textContent = 'Error'; it.statusEl.classList.add('err'); });
-        pickBtn.disabled = false;
-      }
+      });
     }
 
-    uploadBtn.addEventListener('click', uploadAll);
+    // --- Upload SEQUENTIALLY with status polling ---
+    async function uploadSequential() {
+      respEl.hidden = true;
+      pickBtn.disabled = true;
+      uploadBtn.disabled = true;
+
+      const summary = { ok: 0, failed: 0, details: [] };
+
+      for (const item of queue) {
+        // 1) upload
+        const sent = await uploadOne(item);
+        if (!sent.ok || !sent.job_id) {
+          item.statusEl.textContent = 'Failed to submit job';
+          item.statusEl.classList.add('err');
+          summary.details.push({ file:item.file.name, ...sent });
+          summary.failed++;
+          continue;
+        }
+
+        item.bar.style.width = '100%';
+        item.statusEl.textContent = 'Queued (server is ingesting)…';
+
+        // 2) poll status
+        const res = await pollStatus(sent.job_id, (j) => {
+          // update live state
+          if (j.step)  item.statusEl.textContent = `${j.step.replace(/-/g,' ')}…`;
+          if (j.status === 'processing') item.statusEl.textContent = 'Processing…';
+        });
+
+        if (res.ok) {
+          item.statusEl.textContent = 'Ingested';
+          item.statusEl.classList.add('ok');
+          summary.ok++;
+          summary.details.push({ file:item.file.name, ok:true, job_id:sent.job_id, result:res.body?.result || null });
+        } else {
+          const note = res.body?.note || 'Error';
+          item.statusEl.textContent = note;
+          item.statusEl.classList.add('err');
+          summary.failed++;
+          summary.details.push({ file:item.file.name, ok:false, job_id:sent.job_id, error:note, body:res.body });
+        }
+      }
+
+      respEl.hidden = false;
+      respEl.textContent = JSON.stringify(summary, null, 2);
+      queue = [];
+      pickBtn.disabled = false;
+    }
+
+    uploadBtn.addEventListener('click', uploadSequential);
   </script>
 </body>
 </html>
